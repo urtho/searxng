@@ -216,7 +216,7 @@ class PluginDIDResolveTest(SearxTestCase):
             with patch("searx.plugins.did_resolve.http_get", return_value=response):
                 search = do_post_search("did:web:example.com", self.storage)
 
-            stub = searx.engines.engines.get("plugin: did_resolve")
+            stub = searx.engines.engines.get("did_resolve")
             self.assertIsNotNone(stub, "plugin must register a stub engine")
             self.assertGreaterEqual(getattr(stub, "weight", 0), 100.0)
 
@@ -224,6 +224,10 @@ class PluginDIDResolveTest(SearxTestCase):
             self.assertEqual(len(ordered), 1)
             # Score is weight (from stub) * len(positions)=1 / position=1.
             self.assertGreaterEqual(ordered[0].score, 100.0)
+            # Hit-source badge uses the plain plugin id, no "plugin:" prefix.
+            self.assertEqual(ordered[0].engine, "did_resolve")
+            self.assertIn("did_resolve", ordered[0].engines)
+            self.assertNotIn("plugin: did_resolve", ordered[0].engines)
 
     def test_overview_folds_services_into_title_and_content(self):
         # URL-like, whitespace-containing, and object values are skipped when
@@ -279,7 +283,12 @@ class PluginDIDResolveTest(SearxTestCase):
             self.assertEqual(len(main), 1)
             ov = main[0]
 
-            self.assertEqual(ov.url, "https://dev.uniresolver.io/#did:nfd:urtho.algo")
+            # URL carries ?{did}#{did}: the fragment drives the SPA while the
+            # query (no '=') renders as the " › {did}" breadcrumb above the title.
+            self.assertEqual(
+                ov.url,
+                "https://dev.uniresolver.io/?did:nfd:urtho.algo#did:nfd:urtho.algo",
+            )
             # Title is the longest *eligible* value (NFDToken.tokenId, 24 chars).
             # URL, whitespace, and nested-object values are excluded.
             self.assertEqual(ov.title, "NFD-1234567890ABCDEFGHIJKL")

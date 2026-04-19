@@ -254,7 +254,11 @@ class SXNGPlugin(Plugin):
         # overview card always sorts to the top (lazy registration because
         # ``metrics.initialize`` and ``engines.load_engines`` wipe their
         # registries during ``search.initialize`` — *after* ``plugin.init``).
-        synthetic_engine = f"plugin: {self.id}"
+        #
+        # We use the bare plugin id (``did_resolve``) as the engine label so
+        # the card's "hit source" badge shows just the plugin name — not the
+        # ``plugin: <id>`` string that PluginStorage would otherwise stamp.
+        synthetic_engine = self.id
         _ensure_engine_metrics(synthetic_engine)
         _ensure_engine_stub(synthetic_engine, weight=1000.0)
 
@@ -309,14 +313,20 @@ class SXNGPlugin(Plugin):
         results.add(results.types.Answer(answer=_summary(did, doc)))
 
         # Overview as a clickable main result linking to the resolver UI.
+        # The URL carries ``?{did}`` (no ``=``) as well as the SPA fragment
+        # ``#{did}``.  ``get_pretty_url`` renders the query after a ``›``
+        # separator, so the breadcrumb above the title reads
+        # ``{ui_url} › {did}``.  The SPA ignores the query; it routes on the
+        # fragment alone.
         services = doc.get("service") or []
         top_pairs = _top_service_pairs(services, 2)
         title = top_pairs[0][1] if top_pairs else did
         results.add(
             results.types.MainResult(
                 title=title,
-                url=f"{self.ui_url}/#{did}",
+                url=f"{self.ui_url}/?{did}#{did}",
                 content=_overview_content(document_meta, top_pairs),
+                engine=synthetic_engine,
             )
         )
 
