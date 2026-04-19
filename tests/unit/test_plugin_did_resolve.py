@@ -61,7 +61,7 @@ FAKE_DID_DOC = {
 
 def _inject_cfg(test_case):
     searx.settings["did_resolve"] = {
-        "base_url": "http://aca-py.test:8020",
+        "acapy_url": "http://aca-py.test:8020",
         "api_key": "secret",
         "timeout": 5,
     }
@@ -151,7 +151,28 @@ class PluginDIDResolveTest(SearxTestCase):
             expected = Answer(answer="Could not resolve DID did:web:example.com via ACA-Py.")
             self.assertIn(expected, search.result_container.answers)
 
-    def test_nfd_shortcut_rewrites_to_did_nfd(self):
+    @parameterized.expand(
+        [
+            # (query, expected_did)
+            ("nfdomains.algo", "did:nfd:nfdomains.algo"),
+            ("bob-smith.algo", "did:nfd:bob-smith.algo"),
+            # Ethereum account
+            (
+                "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B",
+                "did:ethr:0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B",
+            ),
+            # ENS
+            ("vitalik.eth", "did:ens:vitalik.eth"),
+            # Unstoppable Domains
+            ("brad.crypto", "did:ud:brad.crypto"),
+            # CAIP-10 pkh
+            (
+                "eip155:1:0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B",
+                "did:pkh:eip155:1:0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B",
+            ),
+        ]
+    )
+    def test_shortcut_rewrites(self, query: str, expected: str):
         with self.app.test_request_context():
             sxng_request.preferences = self.pref
 
@@ -160,37 +181,85 @@ class PluginDIDResolveTest(SearxTestCase):
             response.json = Mock(return_value=FAKE_DID_DOC)
 
             with patch("searx.plugins.did_resolve.http_get", return_value=response) as mock_get:
-                do_post_search("nfdomains.algo", self.storage)
+                do_post_search(query, self.storage)
 
             mock_get.assert_called_once()
             url = mock_get.call_args[0][0]
-            self.assertEqual(url, "http://aca-py.test:8020/resolver/resolve/did:nfd:nfdomains.algo")
+            self.assertEqual(url, f"http://aca-py.test:8020/resolver/resolve/{expected}")
 
     @parameterized.expand(
         [
-            "nfdomains.algo",
-            "bob-smith.algo",
-            "sub.domain.algo",
-            "a1.algo",
+            # Not a DID and no shortcut matches => no HTTP call
+            "hello world",
+            "alice",                      # no TLD
+            "foo.com",                    # unsupported TLD
+            "0x123",                      # too short for eth account
+            "0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",  # non-hex
         ]
     )
-    def test_nfd_regex_matches(self, query: str):
-        from searx.plugins.did_resolve import NFD_REGEX  # pylint: disable=import-outside-toplevel
-        self.assertIsNotNone(NFD_REGEX.match(query))
+    def test_shortcut_no_match_is_noop(self, query: str):
+        with self.app.test_request_context():
+            sxng_request.preferences = self.pref
+            with patch("searx.plugins.did_resolve.http_get") as mock_get:
+                do_post_search(query, self.storage)
+                mock_get.assert_not_called()
 
-    @parameterized.expand(
-        [
-            ".algo",
-            "-nfdomains.algo",
-            "nfdomains-.algo",
-            "NFDOMAINS.algo",
-            "nfdomains.algo.foo",
-            "nfdomains.com",
+    def test_custom_shortcut_overrides_defaults(self):
+        # Replace the default shortcut table with a single custom entry that
+        # rewrites ``*.example`` to ``did:demo:<name>``.
+        searx.settings["did_resolve"]["shortcuts"] = [
+            {"name": "demo", "pattern": r"^(?P<name>[a-z]+)\.example$", "rewrite": "did:demo:{name}"},
         ]
-    )
-    def test_nfd_regex_rejects(self, query: str):
-        from searx.plugins.did_resolve import NFD_REGEX  # pylint: disable=import-outside-toplevel
-        self.assertIsNone(NFD_REGEX.match(query))
+
+        storage = searx.plugins.PluginStorage()
+        storage.load_settings({"searx.plugins.did_resolve.SXNGPlugin": {"active": True}})
+        storage.init(self.app)
+
+        with self.app.test_request_context():
+            sxng_request.preferences = searx.preferences.Preferences(["simple"], ["general"], {}, storage)
+            sxng_request.preferences.parse_dict({"locale": "en"})
+
+            response = Mock()
+            response.raise_for_status = Mock()
+            response.json = Mock(return_value=FAKE_DID_DOC)
+
+            with patch("searx.plugins.did_resolve.http_get", return_value=response) as mock_get:
+                do_post_search("alice.example", storage)
+                # Default NFD shortcut should be gone
+                do_post_search("nfdomains.algo", storage)
+
+            self.assertEqual(mock_get.call_count, 1)
+            self.assertEqual(
+                mock_get.call_args[0][0],
+                "http://aca-py.test:8020/resolver/resolve/did:demo:alice",
+            )
+
+    def test_invalid_shortcut_is_skipped_not_fatal(self):
+        searx.settings["did_resolve"]["shortcuts"] = [
+            {"name": "bad-regex", "pattern": "(unclosed", "rewrite": "did:x:{0}"},
+            {"name": "nfd", "pattern": r"^\S+\.algo$", "rewrite": "did:nfd:{0}"},
+        ]
+
+        storage = searx.plugins.PluginStorage()
+        storage.load_settings({"searx.plugins.did_resolve.SXNGPlugin": {"active": True}})
+        storage.init(self.app)
+
+        with self.app.test_request_context():
+            sxng_request.preferences = searx.preferences.Preferences(["simple"], ["general"], {}, storage)
+            sxng_request.preferences.parse_dict({"locale": "en"})
+
+            response = Mock()
+            response.raise_for_status = Mock()
+            response.json = Mock(return_value=FAKE_DID_DOC)
+
+            with patch("searx.plugins.did_resolve.http_get", return_value=response) as mock_get:
+                do_post_search("nfdomains.algo", storage)
+
+            mock_get.assert_called_once()
+            self.assertEqual(
+                mock_get.call_args[0][0],
+                "http://aca-py.test:8020/resolver/resolve/did:nfd:nfdomains.algo",
+            )
 
     def test_method_allowlist_skips_non_matching(self):
         searx.settings["did_resolve"]["methods"] = ["key"]

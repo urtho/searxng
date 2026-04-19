@@ -14,7 +14,7 @@ block exists in ``settings.yml``.
    did_resolve:
      # Base URL of the ACA-Py admin API (with the ``did_resolver`` plugin
      # exposed).  Required.
-     base_url: 'http://localhost:8020'
+     acapy_url: 'http://localhost:8020'
 
      # Optional X-API-Key value (ACA-Py admin API key).
      api_key: null
@@ -25,15 +25,24 @@ block exists in ``settings.yml``.
      # Optional allow-list of DID methods that are forwarded to the resolver.
      # If empty/absent every syntactically valid DID is forwarded.
      methods:
+       - nfd
+       - algo
        - web
        - key
-       - sov
-       - indy
 
-The query is treated as a DID when the whole (trimmed) query is a syntactically
-valid DID or DID URL according to the `W3C DID Core`_ ABNF.  Two short
-summaries are placed in the answer area: one plain-text headline and one
-key/value table with the salient fields of the resolved DID Document.
+     # Optional list of shortcut rewrites.  Each shortcut has a ``name``
+     # (for logs/debug), a ``pattern`` (Python regex, matched against the
+     # whole trimmed query) and a ``rewrite`` template where ``{0}`` is the
+     # full match, ``{1}``, ``{2}`` ... are numbered capture groups and
+     # ``{name}`` are named capture groups.  The first matching shortcut
+     # wins.  When absent, :py:obj:`DEFAULT_SHORTCUTS` is used.
+     shortcuts: []
+
+The query is treated as a DID either directly (syntactically valid DID / DID
+URL per `W3C DID Core`_) or after passing through a shortcut rewrite (e.g. a
+bare Algorand account becomes ``did:algo:<account>``).  Two short summaries
+are placed in the answer area: one plain-text headline and one key/value
+table with the salient fields of the resolved DID Document.
 
 .. _W3C DID Core: https://www.w3.org/TR/did-core/#did-syntax
 """
@@ -42,6 +51,7 @@ from __future__ import annotations
 import re
 import typing as t
 from collections import OrderedDict
+from dataclasses import dataclass
 
 from flask_babel import gettext
 from httpx import HTTPError
@@ -74,13 +84,76 @@ DID_REGEX = re.compile(
     re.VERBOSE,
 )
 
-# NFD (Non-Fungible Domain, Algorand) shortcut: any bare ``*.algo`` query is
-# rewritten to ``did:nfd:<name>.algo`` before resolution.  NFD names are
-# lowercase alphanumeric labels (hyphens allowed inside) separated by dots and
-# ending with the ``.algo`` TLD.
-NFD_REGEX = re.compile(
-    r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.algo$"
-)
+
+# Default shortcut table.  The first shortcut whose ``pattern`` matches the
+# trimmed query is used; its ``rewrite`` template is expanded with ``{0}``
+# (full match), ``{1}`` .. (numbered groups) and ``{name}`` (named groups).
+DEFAULT_SHORTCUTS: list[dict[str, str]] = [
+    # Non-Fungible Domains (Algorand NFDs)
+    {
+        "name": "nfd",
+        "pattern": r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.algo$",
+        "rewrite": "did:nfd:{0}",
+    },
+    # Ethereum account address
+    {
+        "name": "ethr",
+        "pattern": r"^0x[a-fA-F0-9]{40}$",
+        "rewrite": "did:ethr:{0}",
+    },
+    # Ethereum Name Service (*.eth)
+    {
+        "name": "ens",
+        "pattern": r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.eth$",
+        "rewrite": "did:ens:{0}",
+    },
+    # Unstoppable Domains
+    {
+        "name": "ud",
+        "pattern": (
+            r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?"
+            r"\.(?:crypto|nft|wallet|x|dao|blockchain|bitcoin|polygon|888|zil)$"
+        ),
+        "rewrite": "did:ud:{0}",
+    },
+    # CAIP-10 chain account => did:pkh
+    {
+        "name": "pkh",
+        "pattern": (
+            r"^(?:eip155|bip122|solana|cosmos|polkadot|tezos|near|algorand)"
+            r":[a-zA-Z0-9]+:[a-zA-Z0-9]+$"
+        ),
+        "rewrite": "did:pkh:{0}",
+    },
+]
+
+
+@dataclass
+class Shortcut:
+    """Single entry of the shortcut rewrite table."""
+
+    name: str
+    pattern: re.Pattern[str]
+    rewrite: str
+
+    @classmethod
+    def from_dict(cls, d: dict[str, t.Any]) -> "Shortcut":
+        return cls(
+            name=str(d["name"]),
+            pattern=re.compile(str(d["pattern"])),
+            rewrite=str(d["rewrite"]),
+        )
+
+    def apply(self, query: str) -> str | None:
+        """Return the rewritten DID if ``pattern`` matches ``query``, else None."""
+        m = self.pattern.match(query)
+        if not m:
+            return None
+        positional = (m.group(0),) + m.groups()
+        try:
+            return self.rewrite.format(*positional, **m.groupdict())
+        except (IndexError, KeyError):
+            return None
 
 
 class SXNGPlugin(Plugin):
@@ -90,10 +163,11 @@ class SXNGPlugin(Plugin):
 
     def __init__(self, plg_cfg: "PluginCfg") -> None:
         super().__init__(plg_cfg)
-        self.base_url: str = ""
+        self.acapy_url: str = ""
         self.api_key: str | None = None
         self.timeout: float = 10.0
         self.methods: set[str] = set()
+        self.shortcuts: list[Shortcut] = []
 
         self.info = PluginInfo(
             id=self.id,
@@ -104,24 +178,52 @@ class SXNGPlugin(Plugin):
             ),
             examples=[
                 "did:web:example.com",
-                "did:key:z6MkhaXgBZDvotDkL5257faiztiGiC2QtKLGpbnnEGta2doK",
-                "alice.algo",
+                "nfdomains.algo",
+                "0xAb5801a7D398351b8bE11C439e05C5B3259aeC9B",
             ],
             preference_section="query",
         )
 
     def init(self, app: "flask.Flask") -> bool:  # pylint: disable=unused-argument
         cfg = settings.get(self.id) or {}
-        base_url = cfg.get("base_url")
-        if not base_url:
+        acapy_url = cfg.get("acapy_url")
+        if not acapy_url:
             # No configuration provided => plugin stays inactive.
             return False
 
-        self.base_url = str(base_url).rstrip("/")
+        self.acapy_url = str(acapy_url).rstrip("/")
         self.api_key = cfg.get("api_key") or None
         self.timeout = float(cfg.get("timeout", 10))
         self.methods = {str(m).lower() for m in (cfg.get("methods") or [])}
+
+        raw_shortcuts = cfg.get("shortcuts")
+        if raw_shortcuts is None:
+            raw_shortcuts = DEFAULT_SHORTCUTS
+        self.shortcuts = []
+        for raw in raw_shortcuts:
+            try:
+                self.shortcuts.append(Shortcut.from_dict(raw))
+            except (re.error, KeyError, TypeError) as exc:
+                self.log.warning("skipping invalid shortcut %r: %s", raw, exc)
         return True
+
+    def _to_did(self, query: str) -> str | None:
+        """Return the DID to resolve for ``query``, or ``None``."""
+        if DID_REGEX.match(query):
+            return query
+        for sc in self.shortcuts:
+            rewritten = sc.apply(query)
+            if rewritten is None:
+                continue
+            if not DID_REGEX.match(rewritten):
+                self.log.warning(
+                    "shortcut %r produced non-DID value %r for query %r",
+                    sc.name, rewritten, query,
+                )
+                continue
+            self.log.debug("shortcut %r rewrote %r => %r", sc.name, query, rewritten)
+            return rewritten
+        return None
 
     def post_search(self, request: "SXNG_Request", search: "SearchWithPlugins") -> EngineResults:
         results = EngineResults()
@@ -130,7 +232,7 @@ class SXNGPlugin(Plugin):
             return results
 
         query = search.search_query.query.strip()
-        did = _to_did(query)
+        did = self._to_did(query)
         if did is None:
             return results
 
@@ -167,7 +269,7 @@ class SXNGPlugin(Plugin):
         return results
 
     def _resolve(self, did: str) -> dict[str, t.Any] | None:
-        url = f"{self.base_url}/resolver/resolve/{did}"
+        url = f"{self.acapy_url}/resolver/resolve/{did}"
         headers = {"Accept": "application/json"}
         if self.api_key:
             headers["X-API-Key"] = self.api_key
@@ -179,19 +281,6 @@ class SXNGPlugin(Plugin):
         except ValueError:
             self.log.warning("ACA-Py response for %s is not JSON", did)
             return None
-
-
-def _to_did(query: str) -> str | None:
-    """Return a DID string for ``query``, or ``None`` if the query isn't a DID.
-
-    Shortcut: any bare ``*.algo`` query is rewritten to ``did:nfd:<query>``
-    so that NFD names can be typed as-is in the search bar.
-    """
-    if DID_REGEX.match(query):
-        return query
-    if NFD_REGEX.match(query):
-        return f"did:nfd:{query}"
-    return None
 
 
 def _summary(did: str, doc: dict[str, t.Any]) -> str:

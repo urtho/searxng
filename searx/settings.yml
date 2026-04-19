@@ -259,7 +259,7 @@ plugins:
     active: true
 
   searx.plugins.did_resolve.SXNGPlugin:
-    active: false
+    active: true
 
 
 # Configuration of the "DID resolver plugin":
@@ -268,14 +268,30 @@ plugins:
 # is only activated when a did_resolve: block is present.
 #
 # did_resolve:
-#   base_url: 'http://localhost:8020'
+#   acapy_url: 'http://localhost:8020'
 #   api_key: null
 #   timeout: 10
+#
+#   # Optional allow-list of DID methods that get forwarded to ACA-Py.
 #   methods:
+#     - nfd
 #     - web
 #     - key
-#     - sov
-#     - indy
+#     - ethr
+#     - ens
+#
+#   # Optional shortcut rewrite table.  The first pattern that matches the
+#   # whole trimmed query wins; the ``rewrite`` template is expanded with
+#   # {0}=whole match, {1}.. = numbered capture groups, {name} = named groups.
+#   # Omit to use the built-in defaults (NFD, did:ethr, did:ens, Unstoppable
+#   # Domains, CAIP-10 did:pkh).
+#   shortcuts:
+#     - name: nfd
+#       pattern: '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.algo$'
+#       rewrite: 'did:nfd:{0}'
+#     - name: ethr
+#       pattern: '^0x[a-fA-F0-9]{40}$'
+#       rewrite: 'did:ethr:{0}'
 
 
 # Configuration of the "Hostnames plugin":
