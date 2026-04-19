@@ -258,6 +258,25 @@ plugins:
   searx.plugins.tracker_url_remover.SXNGPlugin:
     active: true
 
+  searx.plugins.did_resolve.SXNGPlugin:
+    active: false
+
+
+# Configuration of the "DID resolver plugin":
+#
+# Requires an ACA-Py instance with the did_resolver plugin loaded.  The plugin
+# is only activated when a did_resolve: block is present.
+#
+# did_resolve:
+#   base_url: 'http://localhost:8020'
+#   api_key: null
+#   timeout: 10
+#   methods:
+#     - web
+#     - key
+#     - sov
+#     - indy
+
 
 # Configuration of the "Hostnames plugin":
 #
