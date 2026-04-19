@@ -1,34 +1,40 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """A plugin that detects Decentralized Identifiers (DIDs) in the search query
-and resolves them through an `ACA-Py`_ instance that has the `DIDResolver`_
-plugin loaded.
+and resolves them through a `Universal Resolver`_ HTTP API.
 
-.. _ACA-Py: https://github.com/openwallet-foundation/acapy
-.. _DIDResolver: https://github.com/openwallet-foundation/acapy-plugins/tree/main/did_resolver
+.. _Universal Resolver: https://github.com/decentralized-identity/universal-resolver
 
 The plugin is opt-in: it is only registered when a ``did_resolve:`` settings
-block exists in ``settings.yml``.
+block with a ``uniresolver_url`` is present in ``settings.yml``.
 
 .. code:: yaml
 
    did_resolve:
-     # Base URL of the ACA-Py admin API (with the ``did_resolver`` plugin
-     # exposed).  Required.
-     acapy_url: 'http://localhost:8020'
+     # Base URL of the Universal Resolver HTTP API (origin, without the
+     # ``/1.0/identifiers`` path).  Required.
+     uniresolver_url: 'https://dev.uniresolver.io'
 
-     # Optional X-API-Key value (ACA-Py admin API key).
+     # Optional bearer/api token forwarded as ``X-API-Key`` — only needed
+     # for self-hosted Universal Resolver instances that add auth.
      api_key: null
 
      # HTTP timeout in seconds for the resolve call.
      timeout: 10
 
+     # Optional name of a network defined in ``outgoing.networks``.  This is
+     # how you talk to a plain-HTTP resolver (e.g. a localhost instance)
+     # without globally enabling ``enable_http`` on the default network.
+     # See the ``outgoing.networks`` block in settings.yml for an example.
+     network: 'did_resolver'
+
      # Optional allow-list of DID methods that are forwarded to the resolver.
      # If empty/absent every syntactically valid DID is forwarded.
      methods:
        - nfd
-       - algo
        - web
        - key
+       - ethr
+       - ens
 
      # Optional list of shortcut rewrites.  Each shortcut has a ``name``
      # (for logs/debug), a ``pattern`` (Python regex, matched against the
@@ -40,9 +46,10 @@ block exists in ``settings.yml``.
 
 The query is treated as a DID either directly (syntactically valid DID / DID
 URL per `W3C DID Core`_) or after passing through a shortcut rewrite (e.g. a
-bare Algorand account becomes ``did:algo:<account>``).  Two short summaries
-are placed in the answer area: one plain-text headline and one key/value
-table with the salient fields of the resolved DID Document.
+bare Ethereum address becomes ``did:ethr:0x…``).  Two short summaries are
+placed in the answer area: one plain-text headline and one key/value table
+with the salient fields of the resolved DID Document together with the
+resolution / document metadata blocks returned by the resolver.
 
 .. _W3C DID Core: https://www.w3.org/TR/did-core/#did-syntax
 """
@@ -50,14 +57,16 @@ from __future__ import annotations
 
 import re
 import typing as t
-from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import dataclass
 
 from flask_babel import gettext
 from httpx import HTTPError
 
-from searx import settings
-from searx.network import get as http_get
+import searx.engines
+
+from searx import metrics, settings
+from searx.network import THREADLOCAL, get as http_get, set_context_network_name
 from searx.plugins import Plugin, PluginInfo
 from searx.result_types import EngineResults
 
@@ -157,24 +166,26 @@ class Shortcut:
 
 
 class SXNGPlugin(Plugin):
-    """Resolve a DID via an ACA-Py instance with the ``did_resolver`` plugin."""
+    """Resolve a DID via a Universal Resolver HTTP API endpoint."""
 
     id = "did_resolve"
 
     def __init__(self, plg_cfg: "PluginCfg") -> None:
         super().__init__(plg_cfg)
-        self.acapy_url: str = ""
+        self.uniresolver_url: str = ""
         self.api_key: str | None = None
         self.timeout: float = 10.0
         self.methods: set[str] = set()
         self.shortcuts: list[Shortcut] = []
+        self.network_name: str | None = None
+        self.ui_url: str = "https://dev.uniresolver.io"
 
         self.info = PluginInfo(
             id=self.id,
             name=gettext("DID resolver plugin"),
             description=gettext(
                 "Detects Decentralized Identifiers (DIDs) in the query and resolves"
-                " them through an ACA-Py instance with the DIDResolver plugin."
+                " them through a Universal Resolver HTTP API."
             ),
             examples=[
                 "did:web:example.com",
@@ -186,15 +197,17 @@ class SXNGPlugin(Plugin):
 
     def init(self, app: "flask.Flask") -> bool:  # pylint: disable=unused-argument
         cfg = settings.get(self.id) or {}
-        acapy_url = cfg.get("acapy_url")
-        if not acapy_url:
+        uniresolver_url = cfg.get("uniresolver_url")
+        if not uniresolver_url:
             # No configuration provided => plugin stays inactive.
             return False
 
-        self.acapy_url = str(acapy_url).rstrip("/")
+        self.uniresolver_url = str(uniresolver_url).rstrip("/")
         self.api_key = cfg.get("api_key") or None
         self.timeout = float(cfg.get("timeout", 10))
         self.methods = {str(m).lower() for m in (cfg.get("methods") or [])}
+        self.network_name = cfg.get("network") or None
+        self.ui_url = str(cfg.get("ui_url") or "https://dev.uniresolver.io").rstrip("/")
 
         raw_shortcuts = cfg.get("shortcuts")
         if raw_shortcuts is None:
@@ -236,6 +249,15 @@ class SXNGPlugin(Plugin):
         if did is None:
             return results
 
+        # MainResult goes into the scored/sorted main results.  Register a
+        # per-engine score counter + a stub engine with a high weight so our
+        # overview card always sorts to the top (lazy registration because
+        # ``metrics.initialize`` and ``engines.load_engines`` wipe their
+        # registries during ``search.initialize`` — *after* ``plugin.init``).
+        synthetic_engine = f"plugin: {self.id}"
+        _ensure_engine_metrics(synthetic_engine)
+        _ensure_engine_stub(synthetic_engine, weight=1000.0)
+
         method = DID_REGEX.match(did).group("method")  # type: ignore[union-attr]
         if self.methods and method not in self.methods:
             return results
@@ -243,10 +265,11 @@ class SXNGPlugin(Plugin):
         try:
             payload = self._resolve(did)
         except HTTPError as exc:
-            self.log.warning("ACA-Py resolve failed for %s: %s", did, exc)
+            self.log.warning("Universal Resolver resolve failed for %s: %s", did, exc)
             results.add(
                 results.types.Answer(
-                    answer=gettext("Could not resolve DID %(did)s via ACA-Py.") % {"did": did}
+                    answer=gettext("Could not resolve DID %(did)s via Universal Resolver.")
+                    % {"did": did}
                 )
             )
             return results
@@ -254,33 +277,135 @@ class SXNGPlugin(Plugin):
         if not payload:
             return results
 
-        doc = payload.get("did_document") or payload.get("didDocument") or {}
-        metadata = payload.get("metadata") or payload.get("didResolutionMetadata") or {}
+        # Universal Resolver can return either:
+        # - a wrapped DID Resolution Result: {didDocument, didResolutionMetadata, didDocumentMetadata}
+        # - or the DID Document itself (when the driver honours
+        #   ``Accept: application/did+ld+json``), recognisable by its top-level
+        #   ``id`` starting with ``did:``.
+        if "didDocument" in payload or "did_document" in payload:
+            doc = payload.get("didDocument") or payload.get("did_document") or {}
+            resolution_meta = payload.get("didResolutionMetadata") or {}
+            document_meta = payload.get("didDocumentMetadata") or {}
+        elif isinstance(payload.get("id"), str) and payload["id"].startswith("did:"):
+            doc = payload
+            resolution_meta = {}
+            document_meta = {}
+        else:
+            doc = {}
+            resolution_meta = payload.get("didResolutionMetadata") or {}
+            document_meta = payload.get("didDocumentMetadata") or {}
+
+        error = resolution_meta.get("error") if isinstance(resolution_meta, dict) else None
+        if error:
+            msg = resolution_meta.get("errorMessage") or error
+            results.add(
+                results.types.Answer(
+                    answer=gettext("Universal Resolver could not resolve %(did)s: %(err)s")
+                    % {"did": did, "err": msg}
+                )
+            )
+            return results
 
         results.add(results.types.Answer(answer=_summary(did, doc)))
+
+        # Overview as a clickable main result linking to the resolver UI.
+        services = doc.get("service") or []
+        top_pairs = _top_service_pairs(services, 2)
+        title = top_pairs[0][1] if top_pairs else did
         results.add(
-            results.types.KeyValue(
-                kvmap=_kvmap(did, method, doc, metadata),
-                caption=gettext("DID Document") + f" — {did}",
-                key_title=gettext("Field"),
-                value_title=gettext("Value"),
+            results.types.MainResult(
+                title=title,
+                url=f"{self.ui_url}/#{did}",
+                content=_overview_content(document_meta, top_pairs),
             )
         )
+
         return results
 
     def _resolve(self, did: str) -> dict[str, t.Any] | None:
-        url = f"{self.acapy_url}/resolver/resolve/{did}"
-        headers = {"Accept": "application/json"}
+        url = f"{self.uniresolver_url}/1.0/identifiers/{did}"
+        # Prefer the wrapped DID Resolution Result (has separate metadata).
+        # Fall back to plain JSON/DID Document for drivers that don't honour
+        # the profile parameter; the caller copes with either shape.
+        headers = {
+            "Accept": (
+                'application/ld+json;profile="https://w3id.org/did-resolution",'
+                "application/json,"
+                "application/did+ld+json"
+            )
+        }
         if self.api_key:
             headers["X-API-Key"] = self.api_key
 
-        resp = http_get(url, headers=headers, timeout=self.timeout)
+        with _use_network(self.network_name):
+            resp = http_get(url, headers=headers, timeout=self.timeout)
         resp.raise_for_status()
         try:
             return resp.json()
         except ValueError:
-            self.log.warning("ACA-Py response for %s is not JSON", did)
+            self.log.warning("Universal Resolver response for %s is not JSON", did)
             return None
+
+
+class _EngineStub:
+    """Minimal engine-like object so the score/sort/metrics pipeline accepts a
+    synthetic plugin-emitted result.  Only ``weight`` is actually consulted by
+    ``calculate_score`` — the other attributes satisfy downstream accesses in
+    ``ResultContainer.extend`` / ``get_ordered_results``.
+    """
+
+    def __init__(self, name: str, weight: float):
+        self.name = name
+        self.weight = weight
+        self.categories: list[str] = []
+        self.paging = False
+        self.timeout = 0.0
+
+
+def _ensure_engine_stub(engine_name: str, weight: float) -> None:
+    if engine_name not in searx.engines.engines:
+        searx.engines.engines[engine_name] = t.cast(
+            t.Any, _EngineStub(engine_name, weight)
+        )
+
+
+def _ensure_engine_metrics(engine_name: str) -> None:
+    """Ensure the per-engine counter + histogram entries for ``engine_name``
+    exist.  Synthetic plugin engine names are not registered by
+    :py:obj:`searx.metrics.initialize`, so lookups in :py:obj:`counter_storage`
+    and :py:obj:`histogram_storage` would otherwise raise.
+    """
+    counters = metrics.counter_storage
+    score_key = ("engine", engine_name, "score")
+    if score_key not in counters.counters:
+        counters.configure(*score_key)
+
+    histograms = metrics.histogram_storage
+    hist_key = ("engine", engine_name, "result", "count")
+    if hist_key not in histograms.measures:
+        histograms.configure(1, 100, *hist_key)
+
+
+@contextmanager
+def _use_network(name: str | None):
+    """Switch ``searx.network``'s thread-local context to a named network for
+    the duration of the ``with`` block and restore the previous network on
+    exit.  When ``name`` is falsy the context is left untouched.
+    """
+    if not name:
+        yield
+        return
+
+    had_prev = "network" in THREADLOCAL.__dict__
+    prev = THREADLOCAL.__dict__.get("network")
+    try:
+        set_context_network_name(name)
+        yield
+    finally:
+        if had_prev:
+            THREADLOCAL.network = prev
+        else:
+            THREADLOCAL.__dict__.pop("network", None)
 
 
 def _summary(did: str, doc: dict[str, t.Any]) -> str:
@@ -291,47 +416,100 @@ def _summary(did: str, doc: dict[str, t.Any]) -> str:
     ) % {"did": did, "vm": vm_count, "svc": svc_count}
 
 
-def _kvmap(
-    did: str,
-    method: str,
-    doc: dict[str, t.Any],
-    metadata: dict[str, t.Any],
-) -> "OrderedDict[str, t.Any]":
-    kv: "OrderedDict[str, t.Any]" = OrderedDict()
-    kv[gettext("DID")] = did
-    kv[gettext("Method")] = method
+def _stringify(val: t.Any) -> str:
+    """Flatten a DID-document value (string / list / dict) to one string."""
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        return "\n".join(_stringify(item) for item in val)
+    if isinstance(val, dict):
+        return "\n".join(f"{k}: {_stringify(v)}" for k, v in val.items())
+    return str(val)
 
-    controller = doc.get("controller")
-    if controller:
-        kv[gettext("Controller")] = ", ".join(controller) if isinstance(controller, list) else controller
 
-    also_known_as = doc.get("alsoKnownAs")
-    if also_known_as:
-        kv[gettext("Also known as")] = ", ".join(also_known_as)
+def _rank_length(raw_value: t.Any, val_str: str) -> int:
+    """Effective length of a service-field value for ranking.
 
-    verification_methods = doc.get("verificationMethod") or []
-    if verification_methods:
-        kv[gettext("Verification methods")] = "\n".join(
-            f"{vm.get('id', '?')} ({vm.get('type', '?')})" for vm in verification_methods
-        )
+    Returns ``0`` — i.e. ineligible for title/content promotion — when the
+    value:
+    - is a nested object (dict / list),
+    - contains any whitespace character, or
+    - looks like a URL (contains a ``://`` scheme separator).
 
-    for rel in ("authentication", "assertionMethod", "keyAgreement", "capabilityInvocation", "capabilityDelegation"):
-        refs = doc.get(rel)
-        if refs:
-            kv[rel] = "\n".join(str(r) if isinstance(r, str) else r.get("id", "?") for r in refs)
+    These are surfaced elsewhere (the resolver UI link, service cards) and
+    make poor one-line captions.  Otherwise the string length is returned.
+    """
+    if not val_str:
+        return 0
+    if isinstance(raw_value, (dict, list)):
+        return 0
+    if any(ch.isspace() for ch in val_str):
+        return 0
+    if "://" in val_str:
+        return 0
+    return len(val_str)
 
-    services = doc.get("service") or []
-    if services:
-        kv[gettext("Services")] = "\n".join(
-            f"{s.get('id', '?')} [{s.get('type', '?')}] → {s.get('serviceEndpoint', '?')}" for s in services
-        )
 
-    if metadata:
-        if metadata.get("contentType"):
-            kv[gettext("Content type")] = metadata["contentType"]
-        if metadata.get("retrieved"):
-            kv[gettext("Retrieved")] = metadata["retrieved"]
-        if metadata.get("driverId") or metadata.get("driver_id"):
-            kv[gettext("Driver")] = metadata.get("driverId") or metadata.get("driver_id")
+def _top_service_pairs(services: list[dict[str, t.Any]], n: int) -> list[tuple[str, str]]:
+    """For each non-meta field of each service, emit a ``(service_type, value)``
+    pair.  URL-like, whitespace-containing, and nested-object values are
+    skipped.  Sort by value length (descending) and return the top ``n``.
 
-    return kv
+    ``service_type`` is the service's ``type`` attribute (e.g. ``LinkedDomains``,
+    ``DIDCommMessaging``) — used as the human-readable label in renderings.
+    Fields ``id`` and ``type`` themselves are excluded from the pair set.
+    """
+    candidates: list[tuple[str, str, int]] = []
+    for svc in services:
+        if not isinstance(svc, dict):
+            continue
+        svc_type = svc.get("type")
+        if isinstance(svc_type, list):
+            svc_type = ", ".join(str(x) for x in svc_type)
+        elif svc_type is None:
+            svc_type = gettext("Service")
+        else:
+            svc_type = str(svc_type)
+        for k, v in svc.items():
+            if k in ("id", "type"):
+                continue
+            if v in (None, "", [], {}):
+                continue
+            val_str = _stringify(v)
+            rank = _rank_length(v, val_str)
+            if rank == 0:
+                continue
+            candidates.append((svc_type, val_str, rank))
+    candidates.sort(key=lambda p: p[2], reverse=True)
+    return [(svc_type, val_str) for (svc_type, val_str, _) in candidates[:n]]
+
+
+def _date_only(val: t.Any) -> str:
+    """Strip the time portion from an ISO-8601 timestamp."""
+    if not val:
+        return ""
+    s = str(val)
+    # ISO-8601 uses ``T`` as the separator; some producers use a space.
+    return s.split("T", 1)[0].split(" ", 1)[0]
+
+
+def _overview_content(
+    document_meta: dict[str, t.Any],
+    top_service_pairs: list[tuple[str, str]],
+) -> str:
+    """Content line for the overview result: created/updated dates plus the
+    service field/value pair with the second-longest value (if any).
+    """
+    parts: list[str] = []
+    created = _date_only(document_meta.get("created"))
+    updated = _date_only(document_meta.get("updated"))
+    if created:
+        parts.append(gettext("Created") + ": " + created)
+    if updated:
+        parts.append(gettext("Updated") + ": " + updated)
+    if len(top_service_pairs) >= 2:
+        field, value = top_service_pairs[1]
+        parts.append(f"{field} :: {value}")
+    return " • ".join(parts)

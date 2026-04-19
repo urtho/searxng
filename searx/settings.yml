@@ -17,6 +17,7 @@ general:
   # open_metrics: <password>
   open_metrics: ''
 
+
 brand:
   docs_url: https://docs.searxng.org/
   public_instances: https://searx.space
@@ -218,6 +219,13 @@ outgoing:
   #    - 1.1.1.1
   #    - 1.1.1.2
   #    - fe80::/126
+  #
+  # Named outbound networks referenced by name from engines / plugins.  A
+  # plugin that talks to plain HTTP (e.g. a localhost resolver) can enable
+  # HTTP on its own network without loosening the default one.
+  networks:
+    did_resolver:
+      enable_http: true
 
 
 # Plugin configuration, for more details see
@@ -264,21 +272,32 @@ plugins:
 
 # Configuration of the "DID resolver plugin":
 #
-# Requires an ACA-Py instance with the did_resolver plugin loaded.  The plugin
-# is only activated when a did_resolve: block is present.
+# Uses the Universal Resolver HTTP API (https://dev.uniresolver.io or a
+# self-hosted instance).  The plugin is only activated when a did_resolve:
+# block with uniresolver_url is present.
+did_resolve:
+  uniresolver_url: 'http://localhost:9918'
+  api_key: null        # optional; only for self-hosted instances with auth
+  timeout: 10
+  # Use the dedicated ``did_resolver`` network defined under outgoing.networks
+  # so HTTP can be enabled without affecting the global default network.
+  network: 'did_resolver'
+  enable_http: true
+  shortcuts:
+    - name: nfd
+      pattern: '^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.algo$'
+      rewrite: 'did:nfd:{0}'
+    - name: ethr
+      pattern: '^0x[a-fA-F0-9]{40}$'
+      rewrite: 'did:ethr:{0}'
+
+# Full reference — uncomment and adapt if you want to override the defaults:
 #
 # did_resolve:
-#   acapy_url: 'http://localhost:8020'
+#   uniresolver_url: 'https://dev.uniresolver.io'
 #   api_key: null
 #   timeout: 10
 #
-#   # Optional allow-list of DID methods that get forwarded to ACA-Py.
-#   methods:
-#     - nfd
-#     - web
-#     - key
-#     - ethr
-#     - ens
 #
 #   # Optional shortcut rewrite table.  The first pattern that matches the
 #   # whole trimmed query wins; the ``rewrite`` template is expanded with
