@@ -362,6 +362,12 @@ class _EngineStub:
     synthetic plugin-emitted result.  Only ``weight`` is actually consulted by
     ``calculate_score`` — the other attributes satisfy downstream accesses in
     ``ResultContainer.extend`` / ``get_ordered_results``.
+
+    ``tokens`` carries a private value so the stub is filtered out of the
+    ``/preferences``, ``/stats`` and ``/config`` engine listings (which all
+    run through :py:obj:`searx.preferences.Preferences.validate_token`);
+    otherwise those pages would crash trying to read histograms / traits the
+    stub doesn't provide.
     """
 
     def __init__(self, name: str, weight: float):
@@ -370,6 +376,7 @@ class _EngineStub:
         self.categories: list[str] = []
         self.paging = False
         self.timeout = 0.0
+        self.tokens: list[str] = [f"__plugin:{name}__"]
 
 
 def _ensure_engine_stub(engine_name: str, weight: float) -> None:
