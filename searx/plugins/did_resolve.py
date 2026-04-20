@@ -325,7 +325,7 @@ class SXNGPlugin(Plugin):
             results.types.MainResult(
                 title=title,
                 url=f"{self.ui_url}/?{did}#{did}",
-                content=_overview_content(document_meta, top_pairs),
+                content=_overview_content(document_meta, services),
                 engine=synthetic_engine,
             )
         )
@@ -503,30 +503,46 @@ def _top_service_pairs(services: list[dict[str, t.Any]], n: int) -> list[tuple[s
     return [(svc_type, val_str) for (svc_type, val_str, _) in candidates[:n]]
 
 
-def _date_only(val: t.Any) -> str:
-    """Strip the time portion from an ISO-8601 timestamp."""
-    if not val:
-        return ""
-    s = str(val)
-    # ISO-8601 uses ``T`` as the separator; some producers use a space.
-    return s.split("T", 1)[0].split(" ", 1)[0]
+def _object_endpoint_values(services: list[dict[str, t.Any]]) -> list[str]:
+    """Return all non-URL string values from the first service whose
+    ``serviceEndpoint`` is an object (dict).  Nested structures are flattened
+    and stringified; entries containing ``://`` are skipped.
+    """
+    for svc in services:
+        if not isinstance(svc, dict):
+            continue
+        endpoint = svc.get("serviceEndpoint")
+        if not isinstance(endpoint, dict):
+            continue
+        values: list[str] = []
+        for v in endpoint.values():
+            if v in (None, "", [], {}):
+                continue
+            val_str = _stringify(v)
+            if not val_str or "://" in val_str:
+                continue
+            values.append(val_str)
+        if values:
+            return values
+    return []
 
 
 def _overview_content(
     document_meta: dict[str, t.Any],
-    top_service_pairs: list[tuple[str, str]],
+    services: list[dict[str, t.Any]],
 ) -> str:
-    """Content line for the overview result: created/updated dates plus the
-    service field/value pair with the second-longest value (if any).
+    """Content for the overview result: the ``updated`` date (if any) followed
+    by the non-URL values of the first service whose ``serviceEndpoint`` is an
+    object.  All parts are joined with `` • ``.
+
+    Note: ``content`` is HTML-escaped by ``webapp.py`` *before* the template's
+    ``|safe`` filter renders it, so injecting ``<br>`` for real line breaks is
+    not possible — we use a visible separator instead.
     """
     parts: list[str] = []
-    created = _date_only(document_meta.get("created"))
-    updated = _date_only(document_meta.get("updated"))
-    if created:
-        parts.append(gettext("Created") + ": " + created)
+    updated = document_meta.get("updated")
     if updated:
-        parts.append(gettext("Updated") + ": " + updated)
-    if len(top_service_pairs) >= 2:
-        field, value = top_service_pairs[1]
-        parts.append(f"{field} :: {value}")
+        s = str(updated)
+        parts.append(gettext("Updated") + ": " + s.split("T", 1)[0].split(" ", 1)[0])
+    parts.extend(_object_endpoint_values(services))
     return " • ".join(parts)
