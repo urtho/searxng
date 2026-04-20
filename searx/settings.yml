@@ -105,7 +105,7 @@ server:
 
   secret_key: "ultrasecretkey"  # Is overwritten by ${SEARXNG_SECRET}
   # Proxy image results through SearXNG. Is overwritten by ${SEARXNG_IMAGE_PROXY}
-  image_proxy: false
+  image_proxy: true
   # 1.0 and 1.1 are supported
   http_protocol_version: "1.0"
   # POST queries are "more secure!" but are also the source of hard-to-locate

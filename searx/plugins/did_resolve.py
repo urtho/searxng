@@ -321,11 +321,14 @@ class SXNGPlugin(Plugin):
         services = doc.get("service") or []
         top_pairs = _top_service_pairs(services, 2)
         title = top_pairs[0][1] if top_pairs else did
+        avatar = _avatar_url(services)
+        self.log.debug("did_resolve avatar for %s: %r", did, avatar)
         results.add(
             results.types.MainResult(
                 title=title,
                 url=f"{self.ui_url}/?{did}#{did}",
                 content=_overview_content(document_meta, services),
+                thumbnail=avatar,
                 engine=synthetic_engine,
             )
         )
@@ -501,6 +504,24 @@ def _top_service_pairs(services: list[dict[str, t.Any]], n: int) -> list[tuple[s
             candidates.append((svc_type, val_str, rank))
     candidates.sort(key=lambda p: p[2], reverse=True)
     return [(svc_type, val_str) for (svc_type, val_str, _) in candidates[:n]]
+
+
+def _avatar_url(services: list[dict[str, t.Any]]) -> str:
+    """Return the first URL-looking value stored under an ``avatar`` key inside
+    a dict-valued ``serviceEndpoint``, or ``""`` if none is found.
+    """
+    for svc in services:
+        if not isinstance(svc, dict):
+            continue
+        endpoint = svc.get("serviceEndpoint")
+        if not isinstance(endpoint, dict):
+            continue
+        avatar = endpoint.get("avatar")
+        if not isinstance(avatar, str):
+            continue
+        if "://" in avatar:
+            return avatar
+    return ""
 
 
 def _object_endpoint_values(services: list[dict[str, t.Any]]) -> list[str]:
